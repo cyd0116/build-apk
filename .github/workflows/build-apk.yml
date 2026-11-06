@@ -132,8 +132,20 @@ jobs:
           [ -f package.json ] || NEED=1
           if [ "$NEED" = "0" ]; then echo "zip 自带完整 android 工程，直接构建"; exit 0; fi
           echo "zip 缺原生骨架，从官方源码补齐"
-          curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/heads/${BASE_REF}" -o /tmp/base.zip \
-            || curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/tags/${BASE_REF}" -o /tmp/base.zip
+          # 优先用与定制源码同版本号的官方 tag，避免 master 骨架与旧版 JS 依赖错配
+          VER=$(python3 -c "import json; print(json.load(open('package.json', encoding='utf-8')).get('version',''))" 2>/dev/null || true)
+          echo "定制源码版本号: ${VER:-未知}"
+          BASE_OK=0
+          for REF in ${VER:+v$VER $VER} "$BASE_REF" master; do
+            [ -n "$REF" ] || continue
+            if curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/tags/$REF" -o /tmp/base.zip 2>/dev/null; then
+              echo "骨架来源: tag $REF"; BASE_OK=1; break
+            fi
+            if curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/heads/$REF" -o /tmp/base.zip 2>/dev/null; then
+              echo "骨架来源: branch $REF"; BASE_OK=1; break
+            fi
+          done
+          [ "$BASE_OK" = "1" ] || { echo "::error::官方骨架下载失败，检查 base_ref"; exit 1; }
           rm -rf /tmp/base && mkdir -p /tmp/base
           unzip -q -o /tmp/base.zip -d /tmp/base
           BASE=$(python3 - <<'PY'
@@ -174,6 +186,7 @@ jobs:
           set -e
           if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
           npm run sync-app-name || true
+          [ -d node_modules/react-native ] || { echo "::error::node_modules 里没有 react-native，JS 依赖没装全"; exit 1; }
 
       - name: JDK 17
         uses: actions/setup-java@v4
@@ -196,7 +209,7 @@ jobs:
             SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           fi
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;26.1.10909125"
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;26.1.10909125" "cmake;3.22.1"
 
       - name: 准备 Release 签名（零 Secrets 也能跑）
         id: prep
@@ -231,9 +244,12 @@ jobs:
           python3 - <<'PY'
           import os
           p = 'gradle.properties'
+          keys = ('reactNativeArchitectures=', 'org.gradle.jvmargs=')
           with open(p, encoding='utf-8') as f:
-              lines = [l for l in f if not l.startswith('reactNativeArchitectures=')]
+              lines = [l for l in f if not l.startswith(keys)]
           lines.append('reactNativeArchitectures=%s\n' % os.environ['ABI'])
+          # GitHub runner 约 7GB；RN 全量编译默认堆容易 OOM
+          lines.append('org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8\n')
           with open(p, 'w', encoding='utf-8') as f:
               f.writelines(lines)
           PY
@@ -244,7 +260,63 @@ jobs:
           else
             ARGS="$ARGS assembleDebug"
           fi
-          ./gradlew $ARGS
+          echo "构建命令: ./gradlew $ARGS"
+          set +e
+          ./gradlew $ARGS 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Gradle 退出码 $RC；完整日志已保存，下一步会自动把关键错误写进本页摘要"
+            exit "$RC"
+          fi
+
+      - name: 失败自动诊断（关键错误直接显示在本页）
+        if: failure()
+        run: |
+          set +e
+          LOG="$GITHUB_WORKSPACE/gradle-build.log"
+          {
+            echo "## ❌ 构建失败自动诊断"
+            echo ""
+            echo "把下面这段截图发我即可定位原因；完整日志见同次运行的 Artifacts → build-failure-logs。"
+            echo ""
+            if [ -f "$LOG" ]; then
+              echo "### 关键错误行（最多 60 条）"
+              echo '```text'
+              grep -nE '^\* What went wrong:|^> Task .*FAILED|^FAILURE:|^Caused by:|error:|Error:|fatal error:|ninja:|AAPT2|aapt2|SDK location not found|OutOfMemoryError|Java heap space|Execution failed for task|CXX1429|CMake Error|Could not|not found|NDK|FAIL' "$LOG" | tail -n 60 || true
+              echo '```'
+              echo ""
+              echo "### 日志末尾 40 行"
+              echo '```text'
+              tail -n 40 "$LOG"
+              echo '```'
+              DL=$(find "$HOME/.gradle/daemon" -name '*.out.log' -type f 2>/dev/null | sort | tail -1)
+              if [ -n "$DL" ]; then
+                echo ""
+                echo "### Gradle daemon 日志末尾 30 行"
+                echo '```text'
+                tail -n 30 "$DL"
+                echo '```'
+              fi
+            else
+              echo '```text'
+              echo "未生成 gradle-build.log —— 失败发生在编译之前的步骤，请看上方红色步骤的原始日志。"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传失败日志（Artifacts）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-logs
+          path: |
+            gradle-build.log
+            app/android/app/build/reports/**/*
+            app/android/build/reports/**/*
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: 归集并校验 32 位 APK
         run: |
