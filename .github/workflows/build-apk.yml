@@ -13,7 +13,7 @@ on:
         options: [armeabi-v7a, arm64-v8a, x86, x86_64]
         default: armeabi-v7a
       build_type:
-        description: 'debug 零签名配置、一次成功；release 自动签名正式包'
+        description: 'debug 免手动配置（自动生成签名占位）；release 正式签名包'
         type: choice
         options: [debug, release]
         default: debug
@@ -211,9 +211,10 @@ jobs:
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
           "$SDKM" "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;26.1.10909125" "cmake;3.22.1"
 
-      - name: 准备 Release 签名（零 Secrets 也能跑）
+      # 官方 android/app/build.gradle 在「配置阶段」无条件读取 keystore.properties，
+      # debug 构建同样会因文件缺失抛 FileNotFoundException，所以两种构建类型都必须执行本步。
+      - name: 准备签名配置（debug / release 均需，零 Secrets 也能跑）
         id: prep
-        if: env.BUILD_TYPE == 'release'
         working-directory: app/android
         env:
           LX_KEYSTORE_B64: ${{ secrets.LX_KEYSTORE_B64 }}
@@ -233,6 +234,11 @@ jobs:
           fi
           printf 'storeFile=%s\nstorePassword=lxci2026\nkeyAlias=lxkey\nkeyPassword=lxci2026\nMYAPP_UPLOAD_STORE_FILE=%s\nMYAPP_UPLOAD_STORE_PASSWORD=lxci2026\nMYAPP_UPLOAD_KEY_ALIAS=lxkey\nMYAPP_UPLOAD_KEY_PASSWORD=lxci2026\n' \
             "$KS" "$KS" > keystore.properties
+          # 编译前硬断言：文件存在、非空、含 storeFile，且指向的 keystore 真实可读
+          test -s keystore.properties || { echo "::error::keystore.properties 未生成"; exit 1; }
+          test -f "$KS"               || { echo "::error::签名库不存在: $KS"; exit 1; }
+          grep -q '^storeFile=' keystore.properties || { echo "::error::keystore.properties 缺 storeFile"; exit 1; }
+          echo "签名配置就绪: $PWD/keystore.properties -> $KS"
           echo "ks=$KS" >> "$GITHUB_OUTPUT"
 
       - name: 编译 APK（默认只编 32 位）
@@ -283,7 +289,7 @@ jobs:
             if [ -f "$LOG" ]; then
               echo "### 关键错误行（最多 60 条）"
               echo '```text'
-              grep -nE '^\* What went wrong:|^> Task .*FAILED|^FAILURE:|^Caused by:|error:|Error:|fatal error:|ninja:|AAPT2|aapt2|SDK location not found|OutOfMemoryError|Java heap space|Execution failed for task|CXX1429|CMake Error|Could not|not found|NDK|FAIL' "$LOG" | tail -n 60 || true
+              grep -nE '^\* What went wrong:|^> Task .*FAILED|^FAILURE:|^Caused by:|error:|Error:|fatal error:|ninja:|AAPT2|aapt2|SDK location not found|OutOfMemoryError|Java heap space|Execution failed for task|CXX1429|CMake Error|Could not|not found|NDK|FAIL|FileNotFoundException|keystore\.properties' "$LOG" | tail -n 60 || true
               echo '```'
               echo ""
               echo "### 日志末尾 40 行"
@@ -357,7 +363,7 @@ jobs:
           retention-days: 30
           overwrite: true
 
-      - name: 上传首次生成的签名（供下次复用）
+      - name: 上传首次生成的签名（debug / release 均可固定复用）
         if: steps.prep.outputs.generated == '1'
         uses: actions/upload-artifact@v4
         with:
