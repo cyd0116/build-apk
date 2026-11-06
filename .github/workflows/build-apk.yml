@@ -13,10 +13,10 @@ on:
         options: [armeabi-v7a, arm64-v8a, x86, x86_64]
         default: armeabi-v7a
       build_type:
-        description: 'debug 免手动配置（自动生成签名占位）；release 正式签名包'
+        description: 'release 含 JS bundle，装手机可直接运行（默认）；debug 需连 Metro，仅调试用'
         type: choice
-        options: [debug, release]
-        default: debug
+        options: [release, debug]
+        default: release
       base_ref:
         description: '仅当 zip 不含完整 android 工程时，用于补齐的官方分支/tag'
         default: 'master'
@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     env:
       ABI: ${{ inputs.abi || 'armeabi-v7a' }}
-      BUILD_TYPE: ${{ inputs.build_type || 'debug' }}
+      BUILD_TYPE: ${{ inputs.build_type || 'release' }}
       BASE_REF: ${{ inputs.base_ref || 'master' }}
       SOURCE_TAG: ${{ inputs.source_tag || '' }}
 
@@ -188,6 +188,29 @@ jobs:
           npm run sync-app-name || true
           [ -d node_modules/react-native ] || { echo "::error::node_modules 里没有 react-native，JS 依赖没装全"; exit 1; }
 
+      # RN 的 debug 构建默认 bundleInDebug=false，APK 内没有 assets/index.android.bundle，
+      # 手机没有 Metro 就会红屏 "Unable to load script"。debug 分支显式补打一份。
+      - name: 预打 JS bundle（debug 专属；release 由 Gradle 自动打）
+        if: env.BUILD_TYPE == 'debug'
+        working-directory: app
+        run: |
+          set -euo pipefail
+          ENTRY=$(python3 - <<'PY'
+          import json, os
+          p = json.load(open('package.json', encoding='utf-8'))
+          for c in [p.get('main') or '', 'index.js', 'index.android.js', 'src/index.js', 'src/main.js']:
+              if c and os.path.isfile(c):
+                  print(c); break
+          else:
+              print('index.js')
+          PY
+          )
+          echo "入口文件: $ENTRY"
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle --platform android --dev false --entry-file "$ENTRY" --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res/
+          test -s android/app/src/main/assets/index.android.bundle || { echo "::error::JS bundle 生成失败或为空"; exit 1; }
+          ls -lh android/app/src/main/assets/index.android.bundle
+
       - name: JDK 17
         uses: actions/setup-java@v4
         with:
@@ -267,6 +290,7 @@ jobs:
             ARGS="$ARGS assembleDebug"
           fi
           echo "构建命令: ./gradlew $ARGS"
+          printf '%s\n' "$ARGS" > "$GITHUB_WORKSPACE/gradle-args.txt"
           set +e
           ./gradlew $ARGS 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
           RC=${PIPESTATUS[0]}
@@ -289,7 +313,7 @@ jobs:
             if [ -f "$LOG" ]; then
               echo "### 关键错误行（最多 60 条）"
               echo '```text'
-              grep -nE '^\* What went wrong:|^> Task .*FAILED|^FAILURE:|^Caused by:|error:|Error:|fatal error:|ninja:|AAPT2|aapt2|SDK location not found|OutOfMemoryError|Java heap space|Execution failed for task|CXX1429|CMake Error|Could not|not found|NDK|FAIL|FileNotFoundException|keystore\.properties' "$LOG" | tail -n 60 || true
+              grep -nE '^\* What went wrong:|^> Task .*FAILED|^FAILURE:|^Caused by:|error:|Error:|fatal error:|ninja:|AAPT2|aapt2|SDK location not found|OutOfMemoryError|Java heap space|Execution failed for task|CXX1429|CMake Error|Could not|not found|NDK|FAIL|FileNotFoundException|keystore\.properties|bundleDebugJsAndAssets|bundleReleaseJsAndAssets|index\.android\.bundle|Unable to load script' "$LOG" | tail -n 60 || true
               echo '```'
               echo ""
               echo "### 日志末尾 40 行"
@@ -335,6 +359,22 @@ jobs:
           [ -n "$PICK" ] || PICK=$(find "$ROOT" -type f -name '*.apk' | head -1 || true)
           [ -n "$PICK" ] || { echo "::error::构建结束但没找到任何 APK"; exit 1; }
           echo "选中: $PICK"
+          check_bundle() {
+          python3 - "$1" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          hit = [n for n in z.namelist()
+                 if n == 'assets/index.android.bundle' or n.endswith('/index.android.bundle')]
+          if not hit:
+              print('::warning::APK 内缺 assets/index.android.bundle')
+              sys.exit(1)
+          info = z.getinfo(hit[0])
+          print('JS bundle 校验通过: %s (%d bytes)' % (hit[0], info.file_size))
+          if info.file_size < 10000:
+              print('::warning::JS bundle 异常小，疑似空包')
+              sys.exit(1)
+          PY
+          }
           python3 - "$PICK" "$ABI" <<'PY'
           import sys, zipfile
           apk, abi = sys.argv[1], sys.argv[2]
@@ -351,6 +391,34 @@ jobs:
           else:
               print('::warning::APK 内未发现原生库，跳过 ABI 校验')
           PY
+          if ! check_bundle "$PICK"; then
+            echo "::warning::APK 缺 JS bundle，自动补打并重编一次"
+            cd "$GITHUB_WORKSPACE/app"
+            ENTRY=$(python3 - <<'PY'
+          import json, os
+          p = json.load(open('package.json', encoding='utf-8'))
+          for c in [p.get('main') or '', 'index.js', 'index.android.js', 'src/index.js', 'src/main.js']:
+              if c and os.path.isfile(c):
+                  print(c); break
+          else:
+              print('index.js')
+          PY
+            )
+            mkdir -p android/app/src/main/assets
+            npx react-native bundle --platform android --dev false --entry-file "$ENTRY" --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res/
+            test -s android/app/src/main/assets/index.android.bundle || { echo "::error::补打的 JS bundle 仍为空"; exit 1; }
+            # 清掉 Gradle 生成的同名产物，避免 mergeAssets 出现重复资源
+            rm -rf android/app/build/generated/assets/react android/app/build/intermediates/assets
+            cd android
+            ARGS=$(cat "$GITHUB_WORKSPACE/gradle-args.txt")
+            ./gradlew $ARGS 2>&1 | tee -a "$GITHUB_WORKSPACE/gradle-build.log"
+            cd "$GITHUB_WORKSPACE"
+            PICK=$(find "$ROOT" -type f -name "*${ABI}*.apk" ! -name '*universal*' | head -1 || true)
+            [ -n "$PICK" ] || PICK=$(find "$ROOT" -type f -name '*.apk' ! -name '*universal*' | head -1 || true)
+            [ -n "$PICK" ] || { echo "::error::重编后仍找不到 APK"; exit 1; }
+            echo "选中(补打后): $PICK"
+            check_bundle "$PICK" || { echo "::error::补打后 APK 仍缺 JS bundle，请把本次完整日志发我"; exit 1; }
+          fi
           cp "$PICK" "out/lx-music-mobile-v1.9.2-${ABI}-${BUILD_TYPE}.apk"
           ls -lh out/
 
@@ -388,6 +456,6 @@ jobs:
           else
             gh release create "$TAG" out/*.apk \
               --title "洛雪移动版 v1.9.2 ${ABI} ${BUILD_TYPE}" \
-              --notes "GitHub Actions 自动构建；32 位 = armeabi-v7a。源码：仓库根目录的定制源码 zip。"
+              --notes "GitHub Actions 自动构建；32 位 = armeabi-v7a；已校验 APK 内含 JS bundle。源码：仓库根目录的定制源码 zip。"
           fi
           echo "下载页: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
