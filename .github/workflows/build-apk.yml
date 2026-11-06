@@ -1,0 +1,315 @@
+name: 洛雪移动版 32位APK 自动构建
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '*.md'
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: 'CPU 架构（32位 ARM = armeabi-v7a）'
+        type: choice
+        options: [armeabi-v7a, arm64-v8a, x86, x86_64]
+        default: armeabi-v7a
+      build_type:
+        description: 'debug 零签名配置、一次成功；release 自动签名正式包'
+        type: choice
+        options: [debug, release]
+        default: debug
+      base_ref:
+        description: '仅当 zip 不含完整 android 工程时，用于补齐的官方分支/tag'
+        default: 'master'
+      source_tag:
+        description: '(可选) 源码 zip 作为某个 Release 附件上传时，填该 tag'
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lx-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+      BUILD_TYPE: ${{ inputs.build_type || 'debug' }}
+      BASE_REF: ${{ inputs.base_ref || 'master' }}
+      SOURCE_TAG: ${{ inputs.source_tag || '' }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 定位并解压定制源码（自动修中文/GBK 路径）
+        id: locate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ZIP=""
+          for f in *.zip; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *洛雪*|*lx*|*LX*|*定制*|*v1.9*) ZIP="$f"; break;;
+            esac
+          done
+          if [ -z "$ZIP" ]; then
+            for f in *.zip; do [ -f "$f" ] && { ZIP="$f"; break; }; done
+          fi
+          if [ -z "$ZIP" ] && [ -n "$SOURCE_TAG" ]; then
+            gh release download "$SOURCE_TAG" --pattern '*.zip' --dir . --clobber || true
+            for f in *.zip; do [ -f "$f" ] && { ZIP="$f"; break; }; done
+          fi
+          if [ -z "$ZIP" ]; then
+            gh release download --pattern '*.zip' --dir . --clobber || true
+            for f in *.zip; do [ -f "$f" ] && { ZIP="$f"; break; }; done
+          fi
+          [ -n "$ZIP" ] || { echo "::error::未找到定制源码 zip。请把「洛雪音乐移动版_定制源码_v1.9.2.zip」上传到仓库根目录，或作为 Release 附件上传"; exit 1; }
+          echo "使用源码包: $ZIP"
+          python3 - "$ZIP" <<'PY'
+          import sys, zipfile, os, shutil
+          z = zipfile.ZipFile(sys.argv[1])
+          out = os.path.abspath('src_tmp')
+          shutil.rmtree(out, ignore_errors=True)
+          os.makedirs(out)
+          for info in z.infolist():
+              name = info.filename
+              if not (info.flag_bits & 0x800):
+                  try:
+                      name = name.encode('cp437').decode('gbk')
+                  except Exception:
+                      pass
+              name = name.replace('\\', '/')
+              parts = [p for p in name.split('/') if p not in ('', '.', '..')]
+              if not parts:
+                  continue
+              target = os.path.join(out, *parts)
+              if info.is_dir():
+                  os.makedirs(target, exist_ok=True)
+                  continue
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              with z.open(info) as s, open(target, 'wb') as d:
+                  shutil.copyfileobj(s, d)
+          print('解压完成')
+          PY
+          INNER=$(python3 - <<'PY'
+          import os
+          root = os.path.abspath('src_tmp')
+          hits = [d for d, _, f in os.walk(root) if 'package.json' in f]
+          hits.sort(key=lambda p: (p.count(os.sep), len(p)))
+          print(hits[0] if hits else '')
+          PY
+          )
+          [ -n "$INNER" ] || { echo "::error::zip 里找不到 package.json，不是完整的 RN 工程"; exit 1; }
+          rm -rf "$GITHUB_WORKSPACE/app"
+          mv "$INNER" "$GITHUB_WORKSPACE/app"
+          rm -rf src_tmp
+          # react-native-quick-base64 等 C++ 原生模块不能在中文路径下编译
+          python3 - <<'PY'
+          import os, sys
+          p = os.path.abspath('app')
+          try:
+              p.encode('ascii')
+          except UnicodeEncodeError:
+              print('::error::工程路径含非 ASCII 字符，请把 GitHub 仓库名改成英文（例如 lx-music-build）')
+              sys.exit(1)
+          print('工程路径(纯ASCII):', p)
+          PY
+          echo "src=app" >> "$GITHUB_OUTPUT"
+
+      - name: 必要时补齐原生工程骨架（只补缺失，绝不覆盖定制源码）
+        working-directory: app
+        run: |
+          set -euo pipefail
+          NEED=0
+          [ -f android/gradlew ] || NEED=1
+          [ -f android/gradle/wrapper/gradle-wrapper.jar ] || NEED=1
+          [ -f package.json ] || NEED=1
+          if [ "$NEED" = "0" ]; then echo "zip 自带完整 android 工程，直接构建"; exit 0; fi
+          echo "zip 缺原生骨架，从官方源码补齐"
+          curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/heads/${BASE_REF}" -o /tmp/base.zip \
+            || curl -fsSL "https://codeload.github.com/lyswhut/lx-music-mobile/zip/refs/tags/${BASE_REF}" -o /tmp/base.zip
+          rm -rf /tmp/base && mkdir -p /tmp/base
+          unzip -q -o /tmp/base.zip -d /tmp/base
+          BASE=$(python3 - <<'PY'
+          import os
+          hits = [d for d, _, f in os.walk('/tmp/base') if 'package.json' in f]
+          hits.sort(key=lambda p: (p.count(os.sep), len(p)))
+          print(hits[0] if hits else '')
+          PY
+          )
+          [ -n "$BASE" ] || { echo "::error::官方骨架下载失败，检查 base_ref"; exit 1; }
+          mkdir -p android/gradle/wrapper
+          cp -rn "$BASE/android/." android/ 2>/dev/null || true
+          [ -f gradlew ] || cp -n "$BASE/gradlew" ./gradlew
+          [ -d gradle ] || cp -rn "$BASE/gradle" ./gradle
+          [ -f package.json ] || cp -n "$BASE/package.json" ./package.json
+          [ -f android/gradle/wrapper/gradle-wrapper.jar ] || \
+            cp -n "$BASE/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/
+          chmod +x gradlew android/gradlew 2>/dev/null || true
+          [ -f android/gradlew ] && [ -f android/gradle/wrapper/gradle-wrapper.jar ] || \
+            { echo "::error::原生骨架补齐失败"; exit 1; }
+          echo "原生骨架补齐完成（定制源码未覆盖）"
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 缓存 npm 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('app/package-lock.json', 'app/package.json') }}
+          restore-keys: ${{ runner.os }}-npm-
+
+      - name: 安装 JS 依赖
+        working-directory: app
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npm run sync-app-name || true
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 补齐 Android SDK 组件
+        run: |
+          set -e
+          SDKM=$(find "$ANDROID_HOME" -path '*/cmdline-tools/*/bin/sdkmanager' 2>/dev/null | head -1 || true)
+          if [ -z "$SDKM" ]; then
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmd.zip
+            mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+            unzip -q -o /tmp/cmd.zip -d /tmp/cmd
+            mv /tmp/cmd/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+            SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;26.1.10909125"
+
+      - name: 准备 Release 签名（零 Secrets 也能跑）
+        id: prep
+        if: env.BUILD_TYPE == 'release'
+        working-directory: app/android
+        env:
+          LX_KEYSTORE_B64: ${{ secrets.LX_KEYSTORE_B64 }}
+        run: |
+          set -e
+          KS="$PWD/app/lx-release.keystore"
+          if [ -n "$LX_KEYSTORE_B64" ]; then
+            echo "$LX_KEYSTORE_B64" | base64 -d > "$KS"
+            echo "generated=0" >> "$GITHUB_OUTPUT"
+          else
+            keytool -genkeypair -v -storetype PKCS12 \
+              -keystore "$KS" -alias lxkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass lxci2026 -keypass lxci2026 \
+              -dname "CN=LX Music CI, OU=CI, O=Self, L=Shenzhen, ST=GD, C=CN"
+            echo "generated=1" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'storeFile=%s\nstorePassword=lxci2026\nkeyAlias=lxkey\nkeyPassword=lxci2026\nMYAPP_UPLOAD_STORE_FILE=%s\nMYAPP_UPLOAD_STORE_PASSWORD=lxci2026\nMYAPP_UPLOAD_KEY_ALIAS=lxkey\nMYAPP_UPLOAD_KEY_PASSWORD=lxci2026\n' \
+            "$KS" "$KS" > keystore.properties
+          echo "ks=$KS" >> "$GITHUB_OUTPUT"
+
+      - name: 编译 APK（默认只编 32 位）
+        working-directory: app/android
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          touch gradle.properties
+          python3 - <<'PY'
+          import os
+          p = 'gradle.properties'
+          with open(p, encoding='utf-8') as f:
+              lines = [l for l in f if not l.startswith('reactNativeArchitectures=')]
+          lines.append('reactNativeArchitectures=%s\n' % os.environ['ABI'])
+          with open(p, 'w', encoding='utf-8') as f:
+              f.writelines(lines)
+          PY
+          ARGS="--no-daemon --stacktrace -PreactNativeArchitectures=$ABI"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            KS='${{ steps.prep.outputs.ks }}'
+            ARGS="$ARGS assembleRelease -PMYAPP_UPLOAD_STORE_FILE=$KS -PMYAPP_UPLOAD_STORE_PASSWORD=lxci2026 -PMYAPP_UPLOAD_KEY_ALIAS=lxkey -PMYAPP_UPLOAD_KEY_PASSWORD=lxci2026"
+          else
+            ARGS="$ARGS assembleDebug"
+          fi
+          ./gradlew $ARGS
+
+      - name: 归集并校验 32 位 APK
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ROOT="app/android/app/build/outputs/apk"
+          [ -d "$ROOT" ] || { echo "::error::没有 APK 输出目录，构建可能失败"; exit 1; }
+          PICK=$(find "$ROOT" -type f -name "*${ABI}*.apk" ! -name '*universal*' | head -1 || true)
+          [ -n "$PICK" ] || PICK=$(find "$ROOT" -type f -name '*.apk' ! -name '*universal*' | head -1 || true)
+          [ -n "$PICK" ] || PICK=$(find "$ROOT" -type f -name '*.apk' | head -1 || true)
+          [ -n "$PICK" ] || { echo "::error::构建结束但没找到任何 APK"; exit 1; }
+          echo "选中: $PICK"
+          python3 - "$PICK" "$ABI" <<'PY'
+          import sys, zipfile
+          apk, abi = sys.argv[1], sys.argv[2]
+          z = zipfile.ZipFile(apk)
+          libs = [n for n in z.namelist() if n.startswith('lib/') and n.endswith('.so')]
+          if libs:
+              hit = [n for n in libs if n.startswith('lib/%s/' % abi)]
+              found = sorted(set(n.split('/')[1] for n in libs))
+              if not hit:
+                  print('::error::选中的 APK 不含 %s 原生库，不是目标架构：%s' % (abi, apk))
+                  print('实际包含:', found)
+                  sys.exit(1)
+              print('ABI 校验通过: %s（包内架构: %s）' % (abi, found))
+          else:
+              print('::warning::APK 内未发现原生库，跳过 ABI 校验')
+          PY
+          cp "$PICK" "out/lx-music-mobile-v1.9.2-${ABI}-${BUILD_TYPE}.apk"
+          ls -lh out/
+
+      - name: 上传 32 位 APK 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-music-${{ env.ABI }}-${{ env.BUILD_TYPE }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: 上传首次生成的签名（供下次复用）
+        if: steps.prep.outputs.generated == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-keystore
+          path: app/android/app/lx-release.keystore
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+      - name: 发布到 Releases（无需打 tag，永久留存）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="lx-v1.9.2-${ABI}-${BUILD_TYPE}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.apk --clobber
+          else
+            gh release create "$TAG" out/*.apk \
+              --title "洛雪移动版 v1.9.2 ${ABI} ${BUILD_TYPE}" \
+              --notes "GitHub Actions 自动构建；32 位 = armeabi-v7a。源码：仓库根目录的定制源码 zip。"
+          fi
+          echo "下载页: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
